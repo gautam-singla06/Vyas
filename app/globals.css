@@ -1,0 +1,409 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────
+   Fonts — Inter + Noto Sans Devanagari (Hindi)
+   Self-hosted via next/font (see app/layout.tsx). Exposed as the CSS
+   variables --font-inter and --font-devanagari; referenced below. No
+   render-blocking @import.
+───────────────────────────────────────────────── */
+
+/* ─────────────────────────────────────────────────
+   Vyas Design Tokens (Light default)
+───────────────────────────────────────────────── */
+:root {
+  /* System stacks avoid build-time remote font downloads. */
+  --font-inter: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-outfit: "Segoe UI", Arial, sans-serif;
+  --font-nunito: "Segoe UI", Arial, sans-serif;
+  --font-devanagari: "Nirmala UI", "Noto Sans Devanagari", Mangal, sans-serif;
+
+  /* Backgrounds */
+  --ms-bg:          #FAFAF8;
+  --ms-surface:     #FFFFFF;
+  --ms-surface-2:   #F3F4F6;
+
+  /* Text */
+  --ms-text-primary:   #14181C;
+  --ms-text-secondary: #5B6470;
+  --ms-text-disabled:  #9CA3AF;
+
+  /* Borders */
+  --ms-border:      #E4E7EB;
+  --ms-border-focus:#0F6E5C;
+
+  /* Brand */
+  --ms-brand:       #0F6E5C;
+  --ms-brand-hover: #0A5548;
+  --ms-brand-tint:  #E3F3EF;
+  --ms-brand-light: #B6E2D9;
+
+  /* Severity */
+  --ms-critical:      #D64545;
+  --ms-critical-tint: #FBEAEA;
+  --ms-critical-shadow: rgba(214, 69, 69, 0.18);
+  --ms-warning:       #C98A1F;
+  --ms-warning-tint:  #FBF2E1;
+  --ms-warning-shadow: rgba(201, 138, 31, 0.18);
+  --ms-watch:         #2E8B57;
+  --ms-watch-tint:    #E9F5EE;
+  --ms-watch-shadow:  rgba(46, 139, 87, 0.18);
+
+  /* Shadows */
+  --ms-shadow-card:  0 2px 8px rgba(0,0,0,0.06);
+  --ms-shadow-lg:    0 8px 32px rgba(0,0,0,0.10);
+  --ms-shadow-brand: 0 4px 20px rgba(15, 110, 92, 0.20);
+
+  /* Spacing */
+  --ms-radius-sm:   10px;
+  --ms-radius-md:   16px;
+  --ms-radius-lg:   20px;
+  --ms-radius-xl:   28px;
+
+  /* Motion */
+  --ms-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ms-ease:   cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Fluid scale — viewport-based type scaling */
+  --ms-scale: clamp(0.85, 0.85 + 0.15 * ((100vw - 1280px) / 640px), 1);
+}
+
+/* ─────────────────────────────────────────────────
+   Theme Toggle — Native CSS Variables Dark Mode
+───────────────────────────────────────────────── */
+html.theme-dark {
+  /* Backgrounds */
+  --ms-bg:          #121212;
+  --ms-surface:     #1E1E1E;
+  --ms-surface-2:   #2C2C2C;
+
+  /* Text */
+  --ms-text-primary:   #F9FAFB;
+  --ms-text-secondary: #A1A1AA;
+  --ms-text-disabled:  #52525B;
+
+  /* Borders */
+  --ms-border:      #3F3F46;
+  --ms-border-focus:#4DD0B7;
+
+  /* Brand */
+  --ms-brand:       #16A388;
+  --ms-brand-hover: #138E76;
+  --ms-brand-tint:  rgba(22, 163, 136, 0.15);
+  --ms-brand-light: #4DD0B7;
+
+  /* Severity */
+  --ms-critical:      #EF4444;
+  --ms-critical-tint: rgba(239, 68, 68, 0.15);
+  --ms-critical-shadow: rgba(239, 68, 68, 0.15);
+  --ms-warning:       #F59E0B;
+  --ms-warning-tint:  rgba(245, 158, 11, 0.15);
+  --ms-warning-shadow: rgba(245, 158, 11, 0.15);
+  --ms-watch:         #10B981;
+  --ms-watch-tint:    rgba(16, 185, 129, 0.15);
+  --ms-watch-shadow:  rgba(16, 185, 129, 0.15);
+
+  /* Shadows */
+  --ms-shadow-card:  0 4px 12px rgba(0,0,0,0.5);
+  --ms-shadow-lg:    0 8px 32px rgba(0,0,0,0.6);
+  --ms-shadow-brand: 0 4px 20px rgba(22, 163, 136, 0.20);
+}
+
+/* ─────────────────────────────────────────────────
+   Base Reset & Typography
+───────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+h1, h2, h3, h4, h5, h6, .font-heading {
+  font-family: var(--font-outfit), var(--font-inter), sans-serif;
+  letter-spacing: -0.02em;
+}
+
+/* ─────────────────────────────────────────────────
+   Offline / sync banner offset. The banner is a fixed strip at top:0. When it
+   is visible, SyncBanner adds `.ms-has-banner` to <html>; these rules reserve
+   its height so page content and sticky headers (top:0) sit BELOW it instead
+   of being covered. Removing the class restores the default with no layout jump
+   because the banner only shows in the offline / just-synced states.
+───────────────────────────────────────────────── */
+:root { --ms-banner-h: 2.5rem; }
+html.ms-has-banner body { padding-top: var(--ms-banner-h); }
+html.ms-has-banner header.sticky { top: var(--ms-banner-h); }
+
+html {
+  -webkit-tap-highlight-color: transparent;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-inter), -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background-color: var(--ms-bg);
+  color: var(--ms-text-primary);
+  min-height: 100vh;
+  min-height: 100dvh;
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.5s cubic-bezier(0.4, 0, 0.2, 1), color 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Hindi text — switch to Noto Sans Devanagari */
+:lang(hi), [lang="hi"], .lang-hi {
+  font-family: var(--font-devanagari), var(--font-inter), sans-serif;
+}
+
+/* ─────────────────────────────────────────────────
+   Fluid Scaling System
+   Scales the entire UI proportionally for monitors
+   smaller than 1280px (e.g. hospital 720p displays)
+   Everything shrinks uniformly, layout stays intact.
+───────────────────────────────────────────────── */
+@media (max-width: 1280px) and (min-width: 769px) {
+  html {
+    font-size: clamp(13px, 0.85rem + 0.2vw, 16px);
+  }
+}
+
+/* 720p monitor: scale down proportionally */
+@media (max-height: 768px) and (min-width: 1024px) {
+  .ms-fluid-container {
+    transform-origin: top left;
+    /* Gentle shrink — content stays in place */
+    font-size: clamp(13px, 1vw, 15px);
+  }
+}
+
+/* 16:10 ratio adjustments */
+@media (min-aspect-ratio: 16/10) and (max-aspect-ratio: 16/9) {
+  .ms-sidebar {
+    width: clamp(200px, 18vw, 240px);
+  }
+}
+
+/* ─────────────────────────────────────────────────
+   Scrollbar Styling (thin, branded)
+───────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--ms-border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ms-text-secondary);
+}
+
+/* ─────────────────────────────────────────────────
+   Leaflet Map
+───────────────────────────────────────────────── */
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  border-radius: var(--ms-radius-md);
+  font-family: var(--font-inter), sans-serif !important;
+}
+
+/* ─────────────────────────────────────────────────
+   Utility Classes
+───────────────────────────────────────────────── */
+
+/* Minimum tap target (field app) */
+.tap-target {
+  min-height: 48px;
+  min-width: 48px;
+}
+
+/* Card with severity-tinted shadow */
+.card-critical { box-shadow: var(--ms-shadow-card), 0 0 0 1px var(--ms-critical-tint), 0 4px 16px var(--ms-critical-shadow); }
+.card-warning  { box-shadow: var(--ms-shadow-card), 0 0 0 1px var(--ms-warning-tint),  0 4px 16px var(--ms-warning-shadow); }
+.card-watch    { box-shadow: var(--ms-shadow-card), 0 0 0 1px var(--ms-watch-tint),    0 4px 16px var(--ms-watch-shadow); }
+
+/* Spring press animation */
+@keyframes ms-press {
+  0%   { transform: scale(1); }
+  50%  { transform: scale(0.97); }
+  100% { transform: scale(1); }
+}
+.ms-press:active { animation: ms-press 100ms var(--ms-spring); }
+
+/* Fade + rise animation (chat bubbles, new items) */
+@keyframes ms-fade-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ms-fade-rise {
+  animation: ms-fade-rise 150ms var(--ms-ease) both;
+}
+
+/* Slide in from top (new flag cards) */
+@keyframes ms-slide-in {
+  from { opacity: 0; transform: translateY(-16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ms-slide-in {
+  animation: ms-slide-in 280ms var(--ms-spring) both;
+}
+
+/* Highlight pulse (new flag arrival) */
+@keyframes ms-highlight-pulse {
+  0%   { background-color: var(--ms-brand-tint); }
+  100% { background-color: transparent; }
+}
+.ms-highlight-pulse {
+  animation: ms-highlight-pulse 1000ms var(--ms-ease) both;
+}
+
+/* Voice button pulse ring */
+@keyframes ms-pulse-ring {
+  0%   { transform: scale(1);   opacity: 0.8; }
+  100% { transform: scale(1.4); opacity: 0; }
+}
+.ms-pulse-ring {
+  animation: ms-pulse-ring 600ms var(--ms-ease) infinite;
+}
+
+/* Story scroll fade-in sections */
+@keyframes ms-story-reveal {
+  from { opacity: 0; transform: translateY(24px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ms-story-section {
+  animation: ms-story-reveal 500ms var(--ms-ease) both;
+}
+
+/* Offline banner cross-fade */
+@keyframes ms-xfade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.ms-xfade { animation: ms-xfade 150ms var(--ms-ease); }
+
+/* Morphing pill transition */
+.ms-pill-nav {
+  transition: all 200ms var(--ms-ease);
+  will-change: width, padding;
+}
+
+/* Admin card 3D tilt — applied via JS on hover */
+.ms-tilt-card {
+  transition: transform 250ms var(--ms-spring), box-shadow 250ms var(--ms-ease);
+  will-change: transform;
+  transform-style: preserve-3d;
+  backface-visibility: hidden;
+}
+
+/* Focus ring — branded */
+:focus-visible {
+  outline: 2px solid var(--ms-brand);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ─────────────────────────────────────────────────
+   Story Scroll — Landing Page
+───────────────────────────────────────────────── */
+.ms-story-hero {
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.ms-story-card {
+  opacity: 0;
+  transform: translateY(32px);
+  transition: opacity 600ms var(--ms-ease), transform 600ms var(--ms-ease);
+}
+.ms-story-card.in-view {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Number ticker */
+@keyframes ms-count-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ms-stat-number {
+  animation: ms-count-up 400ms var(--ms-ease) both;
+}
+
+/* Gradient headline */
+.ms-gradient-text {
+  background: linear-gradient(135deg, var(--ms-brand) 0%, #1A9B82 50%, #0A5548 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ─────────────────────────────────────────────────
+   Sidebar — Admin
+───────────────────────────────────────────────── */
+.ms-sidebar {
+  width: clamp(200px, 20vw, 256px);
+  flex-shrink: 0;
+}
+
+/* ─────────────────────────────────────────────────
+   Print — hide UI chrome for reports
+───────────────────────────────────────────────── */
+@media print {
+  .ms-sidebar, header, .ms-sync-banner { display: none !important; }
+  body { background: white; }
+}
+
+/* ─────────────────────────────────────────────────
+   Landing Page Animations (Moved from JS for Performance)
+───────────────────────────────────────────────── */
+/* Scroll Reveal */
+.js-reveal { opacity: 0; transform: translateY(24px); transition: opacity 600ms cubic-bezier(0.4,0,0.2,1), transform 600ms cubic-bezier(0.4,0,0.2,1); will-change: opacity, transform; }
+.js-reveal.revealed { opacity: 1; transform: translateY(0); }
+.js-reveal-d1 { transition-delay: 80ms; }
+.js-reveal-d2 { transition-delay: 160ms; }
+.js-reveal-d3 { transition-delay: 240ms; }
+.js-reveal-d4 { transition-delay: 320ms; }
+
+/* Hero Load Animations */
+@keyframes heroFadeUp {
+  from { opacity: 0; transform: translate3d(0, 30px, 0); }
+  to { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+.hero-animate {
+  animation: heroFadeUp 800ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+  opacity: 0;
+  will-change: opacity, transform;
+}
+.hero-d1 { animation-delay: 100ms; }
+.hero-d2 { animation-delay: 200ms; }
+.hero-d3 { animation-delay: 300ms; }
+.hero-d4 { animation-delay: 400ms; }
+
+/* Floating background shapes */
+@keyframes float {
+  0% { transform: translate3d(0, 0px, 0); }
+  50% { transform: translate3d(0, -15px, 0); }
+  100% { transform: translate3d(0, 0px, 0); }
+}
+.animate-float {
+  animation: float 6s ease-in-out infinite;
+  will-change: transform;
+}
+.animate-float-delayed {
+  animation: float 7s ease-in-out infinite 2s;
+  will-change: transform;
+}
+
+/* Smooth return for tilt cards */
+.tilt-card {
+  transition: transform 300ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 300ms ease-out;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) { *, ::before, ::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; } }

@@ -1,0 +1,1458 @@
+﻿diff --git a/app/admin/layout.tsx b/app/admin/layout.tsx
+index 80bb2aa..4fc9822 100644
+--- a/app/admin/layout.tsx
++++ b/app/admin/layout.tsx
+@@ -1,6 +1,7 @@
+ import Link from "next/link";
+ import { getCurrentStaff } from "@/lib/auth/context";
+ import ThemeToggle from "@/components/ThemeToggle";
++import SignOutButton from "@/components/SignOutButton";
+ 
+ export default async function AdminLayout({ children }: { children: React.ReactNode }) {
+   const staff = await getCurrentStaff();
+@@ -40,12 +41,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
+               Weekly Report
+             </a>
+             <ThemeToggle />
+-            <Link
+-              href="/sign-out"
+-              className="rounded-ms-sm border border-ms-border px-3 py-2 text-sm text-ms-textSecondary transition-colors hover:border-brand hover:text-brand"
+-            >
+-              Sign out
+-            </Link>
++            <SignOutButton className="rounded-ms-sm border border-ms-border px-3 py-2 text-sm text-ms-textSecondary transition-colors hover:border-brand hover:text-brand" />
+           </div>
+         </div>
+       </header>
+@@ -55,7 +51,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
+           <div className="rounded-ms-md border border-[#E8C97A] bg-warning-tint p-5 text-sm text-warning">
+             <p className="font-semibold">Account not registered</p>
+             <p className="mt-1">Your phone number is not in Vyas.{" "}
+-              <a href="/sign-out" className="font-medium underline">Sign out</a>
++              <SignOutButton className="font-medium underline" />
+             </p>
+           </div>
+         ) : staff.role !== "admin" ? (
+diff --git a/app/admin/page.tsx b/app/admin/page.tsx
+index 517b20a..35c7886 100644
+--- a/app/admin/page.tsx
++++ b/app/admin/page.tsx
+@@ -13,10 +13,12 @@ export default async function AdminPage() {
+   if (!staff) return null; // layout shows the not-registered notice
+   if (staff.role !== "admin") return null; // layout shows the role-mismatch notice
+ 
++  // Pass the already-resolved staff context into each query so they don't each
++  // re-run getCurrentStaff (4├ù auth + staff reads for one page load).
+   const [flags, facilities, suggestions] = await Promise.all([
+-    getDistrictFlags(),
+-    getDistrictFacilities(),
+-    getDistrictSuggestions(),
++    getDistrictFlags(staff),
++    getDistrictFacilities(staff),
++    getDistrictSuggestions(staff),
+   ]);
+ 
+   // Only unresolved flags appear on the live dashboard ΓÇö the runner escalates
+diff --git a/app/api/admin/flags/route.ts b/app/api/admin/flags/route.ts
+index e672dad..6632834 100644
+--- a/app/api/admin/flags/route.ts
++++ b/app/api/admin/flags/route.ts
+@@ -1,12 +1,21 @@
+ import { NextResponse } from "next/server";
+ import { getDistrictFlags } from "@/domain/admin/queries";
++import { getCurrentStaff } from "@/lib/auth/context";
+ 
+ // POST-only helper the dashboard's realtime subscription calls on a `flags`
+ // table change to re-sync the full ordered list (the row-level payload from
+ // Supabase Realtime doesn't carry joined facility names, so a uniform re-fetch
+ // keeps the dashboard coherent).
+ export async function POST() {
+-  const flags = await getDistrictFlags();
++  // Reject unauthenticated / non-admin callers with a real 401 instead of
++  // quietly returning an empty list (which leaks that the endpoint exists and
++  // is inconsistent with REST conventions).
++  const staff = await getCurrentStaff();
++  if (!staff || staff.role !== "admin") {
++    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++  }
++
++  const flags = await getDistrictFlags(staff);
+   return NextResponse.json({ flags });
+ }
+ 
+diff --git a/app/api/sms-webhook/route.ts b/app/api/sms-webhook/route.ts
+index fa90443..d0a8d63 100644
+--- a/app/api/sms-webhook/route.ts
++++ b/app/api/sms-webhook/route.ts
+@@ -1,14 +1,27 @@
+ import { NextResponse } from "next/server";
+ import { processMessagePipeline } from "@/lib/ats/pipeline";
+ import { checkRateLimit } from "@/lib/rate-limit";
++import { validateTwilioSignature, externalRequestUrl, escapeXml } from "@/lib/twilio";
+ 
+ // SMS webhook (Twilio incoming)
+ export async function POST(req: Request) {
+   try {
+     const formData = await req.formData();
+-    const body = formData.get("Body")?.toString() || "";
+-    const from = formData.get("From")?.toString() || ""; 
+-    
++
++    // 1. Verify this POST actually came from Twilio (signed with our auth
++    //    token). Without this the endpoint is spoofable by anyone.
++    const params: Record<string, string> = {};
++    formData.forEach((value, key) => {
++      params[key] = value.toString();
++    });
++    const signature = req.headers.get("x-twilio-signature");
++    if (!validateTwilioSignature(externalRequestUrl(req), params, signature)) {
++      return NextResponse.json({ error: "Invalid signature" }, { status: 403 });
++    }
++
++    const body = params.Body || "";
++    const from = params.From || "";
++
+     if (!body || !from) {
+       return NextResponse.json({ error: "Missing Body or From" }, { status: 400 });
+     }
+@@ -34,7 +47,7 @@ export async function POST(req: Request) {
+     // Twilio TwiML response
+     const xml = `<?xml version="1.0" encoding="UTF-8"?>
+ <Response>
+-  <Message>${result.response.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</Message>
++  <Message>${escapeXml(result.response)}</Message>
+ </Response>`;
+ 
+     return new NextResponse(xml, { headers: { "Content-Type": "text/xml" } });
+diff --git a/app/api/whatsapp-webhook/route.ts b/app/api/whatsapp-webhook/route.ts
+index 2a1f88f..58d02d5 100644
+--- a/app/api/whatsapp-webhook/route.ts
++++ b/app/api/whatsapp-webhook/route.ts
+@@ -1,14 +1,27 @@
+ import { NextResponse } from "next/server";
+ import { processMessagePipeline } from "@/lib/ats/pipeline";
+ import { checkRateLimit } from "@/lib/rate-limit";
++import { validateTwilioSignature, externalRequestUrl, escapeXml } from "@/lib/twilio";
+ 
+ // WhatsApp webhook (Twilio incoming)
+ export async function POST(req: Request) {
+   try {
+     const formData = await req.formData();
+-    const body = formData.get("Body")?.toString() || "";
+-    const from = formData.get("From")?.toString() || ""; // Format: "whatsapp:+919876543210"
+-    
++
++    // 1. Verify this POST actually came from Twilio (signed with our auth
++    //    token). Without this the endpoint is spoofable by anyone.
++    const params: Record<string, string> = {};
++    formData.forEach((value, key) => {
++      params[key] = value.toString();
++    });
++    const signature = req.headers.get("x-twilio-signature");
++    if (!validateTwilioSignature(externalRequestUrl(req), params, signature)) {
++      return NextResponse.json({ error: "Invalid signature" }, { status: 403 });
++    }
++
++    const body = params.Body || "";
++    const from = params.From || ""; // Format: "whatsapp:+919876543210"
++
+     if (!body || !from) {
+       return NextResponse.json({ error: "Missing Body or From" }, { status: 400 });
+     }
+@@ -35,7 +48,7 @@ export async function POST(req: Request) {
+     // Twilio TwiML response
+     const xml = `<?xml version="1.0" encoding="UTF-8"?>
+ <Response>
+-  <Message>${result.response.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</Message>
++  <Message>${escapeXml(result.response)}</Message>
+ </Response>`;
+ 
+     return new NextResponse(xml, { headers: { "Content-Type": "text/xml" } });
+diff --git a/app/doctor/layout.tsx b/app/doctor/layout.tsx
+index 21a271f..605c091 100644
+--- a/app/doctor/layout.tsx
++++ b/app/doctor/layout.tsx
+@@ -1,6 +1,7 @@
+ import Link from "next/link";
+ import { getCurrentStaff } from "@/lib/auth/context";
+ import ThemeToggle from "@/components/ThemeToggle";
++import SignOutButton from "@/components/SignOutButton";
+ 
+ export default async function DoctorLayout({ children }: { children: React.ReactNode }) {
+   const staff = await getCurrentStaff();
+@@ -26,12 +27,7 @@ export default async function DoctorLayout({ children }: { children: React.React
+ 
+           <div className="flex items-center gap-2 flex-shrink-0">
+             <ThemeToggle />
+-            <Link
+-              href="/sign-out"
+-              className="rounded-ms-sm border border-ms-border px-3 py-2 text-sm text-ms-textSecondary transition-colors hover:border-brand hover:text-brand"
+-            >
+-              Sign out
+-            </Link>
++            <SignOutButton className="rounded-ms-sm border border-ms-border px-3 py-2 text-sm text-ms-textSecondary transition-colors hover:border-brand hover:text-brand" />
+           </div>
+         </div>
+       </header>
+@@ -41,7 +37,7 @@ export default async function DoctorLayout({ children }: { children: React.React
+           <div className="rounded-ms-md border border-[#E8C97A] bg-warning-tint p-5 text-sm text-warning">
+             <p className="font-semibold">Account not registered</p>
+             <p className="mt-1">Your phone number is not registered as Vyas staff.{" "}
+-              <a href="/sign-out" className="font-medium underline">Sign out</a>
++              <SignOutButton className="font-medium underline" />
+             </p>
+           </div>
+         ) : (
+diff --git a/app/globals.css b/app/globals.css
+index 6ded2cc..3a2ee09 100644
+--- a/app/globals.css
++++ b/app/globals.css
+@@ -4,9 +4,10 @@
+ 
+ /* ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    Fonts ΓÇö Inter + Noto Sans Devanagari (Hindi)
+-   Loaded via preconnect; no render-blocking FOUT
++   Self-hosted via next/font (see app/layout.tsx). Exposed as the CSS
++   variables --font-inter and --font-devanagari; referenced below. No
++   render-blocking @import.
+ ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */
+-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+Devanagari:wght@400;500;600;700&display=swap');
+ 
+ /* ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    Vyas Design Tokens (Light default)
+@@ -100,13 +101,24 @@ html.theme-dark [data-no-invert] {
+   box-sizing: border-box;
+ }
+ 
++/* ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++   Offline / sync banner offset. The banner is a fixed strip at top:0. When it
++   is visible, SyncBanner adds `.ms-has-banner` to <html>; these rules reserve
++   its height so page content and sticky headers (top:0) sit BELOW it instead
++   of being covered. Removing the class restores the default with no layout jump
++   because the banner only shows in the offline / just-synced states.
++ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */
++:root { --ms-banner-h: 2.5rem; }
++html.ms-has-banner body { padding-top: var(--ms-banner-h); }
++html.ms-has-banner header.sticky { top: var(--ms-banner-h); }
++
+ html {
+   -webkit-tap-highlight-color: transparent;
+   scroll-behavior: smooth;
+ }
+ 
+ body {
+-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
++  font-family: var(--font-inter), -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+   background-color: var(--ms-bg);
+   color: var(--ms-text-primary);
+   min-height: 100vh;
+@@ -119,7 +131,7 @@ body {
+ 
+ /* Hindi text ΓÇö switch to Noto Sans Devanagari */
+ :lang(hi), [lang="hi"], .lang-hi {
+-  font-family: 'Noto Sans Devanagari', 'Inter', sans-serif;
++  font-family: var(--font-devanagari), var(--font-inter), sans-serif;
+ }
+ 
+ /* ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+@@ -173,7 +185,7 @@ body {
+   height: 100%;
+   width: 100%;
+   border-radius: var(--ms-radius-md);
+-  font-family: 'Inter', sans-serif !important;
++  font-family: var(--font-inter), sans-serif !important;
+ }
+ 
+ /* ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+diff --git a/app/layout.tsx b/app/layout.tsx
+index 3a064dc..804f804 100644
+--- a/app/layout.tsx
++++ b/app/layout.tsx
+@@ -1,9 +1,27 @@
+ import type { Metadata, Viewport } from "next";
++import { Inter, Noto_Sans_Devanagari } from "next/font/google";
+ import "./globals.css";
+ import { LanguageProvider } from "@/lib/i18n/LanguageContext";
+ import { SyncProvider } from "@/lib/offline/sync-provider";
+ import SyncBanner from "@/components/SyncBanner";
+ 
++// Self-hosted via next/font: no render-blocking external stylesheet, fonts are
++// served same-origin with `font-display: swap` and preloaded automatically.
++// Exposed as CSS variables consumed by Tailwind + globals.css.
++const inter = Inter({
++  subsets: ["latin"],
++  weight: ["400", "500", "600", "700", "800"],
++  variable: "--font-inter",
++  display: "swap",
++});
++
++const notoDevanagari = Noto_Sans_Devanagari({
++  subsets: ["devanagari"],
++  weight: ["400", "500", "600", "700"],
++  variable: "--font-devanagari",
++  display: "swap",
++});
++
+ export const metadata: Metadata = {
+   title: "Vyas ΓÇö District PHC/CHC Resource & Early-Warning Platform",
+   description:
+@@ -22,7 +40,8 @@ export const viewport: Viewport = {
+   themeColor: "#0F6E5C",
+   width: "device-width",
+   initialScale: 1,
+-  maximumScale: 1,
++  // No maximumScale ΓÇö clamping zoom is a WCAG 1.4.4 violation (users with low
++  // vision must be able to zoom to at least 200%).
+ };
+ 
+ export default function RootLayout({
+@@ -31,16 +50,7 @@ export default function RootLayout({
+   children: React.ReactNode;
+ }) {
+   return (
+-    <html lang="en">
+-      <head>
+-        {/* Preconnect for Google Fonts */}
+-        <link rel="preconnect" href="https://fonts.googleapis.com" />
+-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+-        <link
+-          href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+Devanagari:wght@400;500;600;700&display=swap"
+-          rel="stylesheet"
+-        />
+-      </head>
++    <html lang="en" className={`${inter.variable} ${notoDevanagari.variable}`}>
+       <body className="min-h-screen bg-ms-bg font-sans text-ms-textPrimary antialiased">
+         <LanguageProvider>
+           <SyncProvider>
+diff --git a/app/login/login-client.tsx b/app/login/login-client.tsx
+index 6498d34..bb512c5 100644
+--- a/app/login/login-client.tsx
++++ b/app/login/login-client.tsx
+@@ -14,7 +14,7 @@ const getClient = () => {
+   return supabaseSingleton;
+ };
+ 
+-type Step = "choose" | "phone" | "email" | "otp" | "verifying" | "not_registered" | "error";
++type Step = "choose" | "phone" | "email" | "otp" | "verifying" | "not_registered";
+ 
+ export default function LoginPage() {
+   const { t } = useLanguage();
+@@ -25,28 +25,39 @@ export default function LoginPage() {
+   const [password, setPassword] = useState("");
+   const [otp, setOtp] = useState("");
+   const [message, setMessage] = useState<string | null>(null);
++  // Whether `message` represents an error (vs. an informational note like
++  // "code sent"). The error banner keys off this so an email-flow error never
++  // renders under the phone form (they no longer share a generic "error" step).
++  const [errored, setErrored] = useState(false);
+   const [busy, setBusy] = useState(false);
+ 
+   const normalizePhone = (raw: string) => {
+-    const digits = raw.replace(/\D/g, "");
+-    return digits.startsWith("91") || digits.length === 10
+-      ? `+91${digits.replace(/^91/, "")}`
+-      : `+${digits}`;
++    const trimmed = raw.trim();
++    // Respect an explicit international number the user already typed.
++    if (trimmed.startsWith("+")) return `+${trimmed.replace(/\D/g, "")}`;
++    const digits = trimmed.replace(/\D/g, "");
++    // Bare 10-digit input => Indian mobile (the login form is India-scoped).
++    if (digits.length === 10) return `+91${digits}`;
++    // 12 digits starting with the Indian country code.
++    if (digits.length === 12 && digits.startsWith("91")) return `+${digits}`;
++    // Otherwise assume the user included their own country code.
++    return `+${digits}`;
+   };
+ 
+   async function signInWithEmail(e: React.FormEvent) {
+     e.preventDefault();
+     setBusy(true);
+     setMessage(null);
++    setErrored(false);
+     const { error } = await getClient().auth.signInWithPassword({
+       email,
+       password,
+     });
+     if (error) {
+       setBusy(false);
+-      setStep("error");
++      setErrored(true);
+       setMessage(error.message);
+-      return;
++      return; // stay on the email form
+     }
+     const res = await fetch("/api/login-resolve", { method: "POST" });
+     const data = await res.json();
+@@ -60,16 +71,18 @@ export default function LoginPage() {
+       setStep("not_registered");
+       return;
+     }
+-    setStep("error");
++    setErrored(true);
+     setMessage(t.resolve_error);
+   }
+ 
+   async function sendOtp(e: React.FormEvent) {
+     e.preventDefault();
+     setMessage(null);
++    setErrored(false);
+     const fullPhone = normalizePhone(phone);
+     if (fullPhone.replace(/\D/g, "").length < 12) {
+-      setStep("error");
++      setStep("phone");
++      setErrored(true);
+       setMessage(t.invalid_phone);
+       return;
+     }
+@@ -78,7 +91,8 @@ export default function LoginPage() {
+     const { error } = await getClient().auth.signInWithOtp({ phone: fullPhone });
+     setBusy(false);
+     if (error) {
+-      setStep("error");
++      setStep("phone");
++      setErrored(true);
+       setMessage(error.message);
+       return;
+     }
+@@ -89,6 +103,7 @@ export default function LoginPage() {
+   async function verifyOtp(e: React.FormEvent) {
+     e.preventDefault();
+     setMessage(null);
++    setErrored(false);
+     setBusy(true);
+     setStep("verifying");
+     const { error } = await getClient().auth.verifyOtp({
+@@ -99,6 +114,7 @@ export default function LoginPage() {
+     if (error) {
+       setBusy(false);
+       setStep("otp");
++      setErrored(true);
+       setMessage(error.message);
+       return;
+     }
+@@ -116,7 +132,8 @@ export default function LoginPage() {
+       setStep("not_registered");
+       return;
+     }
+-    setStep("error");
++    setStep("otp");
++    setErrored(true);
+     setMessage(t.resolve_error);
+   }
+ 
+@@ -146,7 +163,7 @@ export default function LoginPage() {
+         </div>
+ 
+         <div className="rounded-ms-md border border-ms-border bg-ms-surface p-6 shadow-card-lg">
+-          {step === "error" && message && (
++          {errored && message && (
+             <div className="mb-4 flex items-start gap-2 rounded-ms-sm border border-[#EDB3B3] bg-critical-tint px-4 py-3 text-sm text-critical ms-xfade">
+               <svg viewBox="0 0 16 16" fill="currentColor" className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true">
+                 <path fillRule="evenodd" d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM0 8a8 8 0 1116 0A8 8 0 010 8zm7.25-3.25a.75.75 0 011.5 0v3.5a.75.75 0 01-1.5 0v-3.5zm.75 6a.75.75 0 100 1.5.75.75 0 000-1.5z" clipRule="evenodd"/>
+@@ -245,7 +262,7 @@ export default function LoginPage() {
+               </button>
+               <button
+                 type="button"
+-                onClick={() => setStep("choose")}
++                onClick={() => { setStep("choose"); setErrored(false); setMessage(null); }}
+                 className="w-full text-sm text-ms-textSecondary hover:text-ms-textPrimary"
+               >
+                 ΓåÉ {t.back}
+@@ -253,7 +270,7 @@ export default function LoginPage() {
+             </form>
+           )}
+ 
+-          {(step === "phone" || step === "error") && (
++          {step === "phone" && (
+             <form onSubmit={sendOtp} className="space-y-4">
+               <div>
+                 <label htmlFor="phone-input" className="mb-1.5 block text-sm font-medium text-ms-textPrimary">
+@@ -284,7 +301,7 @@ export default function LoginPage() {
+               </button>
+               <button
+                 type="button"
+-                onClick={() => setStep("choose")}
++                onClick={() => { setStep("choose"); setErrored(false); setMessage(null); }}
+                 className="w-full text-sm text-ms-textSecondary hover:text-ms-textPrimary"
+               >
+                 ΓåÉ {t.back}
+@@ -328,7 +345,7 @@ export default function LoginPage() {
+               </button>
+               <button
+                 type="button"
+-                onClick={() => { setStep("phone"); setOtp(""); setMessage(null); }}
++                onClick={() => { setStep("phone"); setOtp(""); setMessage(null); setErrored(false); }}
+                 className="w-full text-sm text-ms-textSecondary hover:text-ms-textPrimary"
+               >
+                 {t.use_different_number}
+@@ -349,7 +366,7 @@ export default function LoginPage() {
+               </p>
+               <button
+                 type="button"
+-                onClick={() => { setStep("choose"); setOtp(""); setMessage(null); }}
++                onClick={() => { setStep("choose"); setOtp(""); setMessage(null); setErrored(false); }}
+                 className="w-full rounded-ms-sm border border-ms-border px-4 py-3 text-sm font-medium hover:bg-ms-bg"
+               >
+                 {t.try_different_method}
+diff --git a/app/page.tsx b/app/page.tsx
+index 30239dd..973cc5e 100644
+--- a/app/page.tsx
++++ b/app/page.tsx
+@@ -3,6 +3,7 @@ import { getCurrentStaff } from "@/lib/auth/context";
+ import ThemeToggle from "@/components/ThemeToggle";
+ import LangToggle from "@/components/LangToggle";
+ import LandingStoryClient from "@/components/LandingStoryClient";
++import SignOutButton from "@/components/SignOutButton";
+ 
+ // Force dynamic ΓÇö auth lookup is server-side
+ export const dynamic = "force-dynamic";
+@@ -38,12 +39,7 @@ export default async function RootPage() {
+             <LangToggle />
+             <ThemeToggle />
+             {staff ? (
+-              <a
+-                href="/sign-out"
+-                className="rounded-ms-sm border border-ms-border px-3 py-2 text-sm font-medium text-ms-textSecondary transition-colors hover:border-brand hover:text-brand"
+-              >
+-                Sign out
+-              </a>
++              <SignOutButton className="rounded-ms-sm border border-ms-border px-3 py-2 text-sm font-medium text-ms-textSecondary transition-colors hover:border-brand hover:text-brand" />
+             ) : (
+               <Link
+                 href="/login"
+diff --git a/app/public/layout.tsx b/app/public/layout.tsx
+index 7a73ca3..f70d2b9 100644
+--- a/app/public/layout.tsx
++++ b/app/public/layout.tsx
+@@ -1,6 +1,3 @@
+-import Link from "next/link";
+-import ThemeToggle from "@/components/ThemeToggle";
+-
+ // Public layout ΓÇö no auth required, deliberately minimal chrome.
+ // The pill navbar lives inside PatientLookupClient (per UI&UX.md ┬º5).
+ export default function PublicLayout({ children }: { children: React.ReactNode }) {
+diff --git a/app/sign-out/route.ts b/app/sign-out/route.ts
+index 49a5bee..680cf72 100644
+--- a/app/sign-out/route.ts
++++ b/app/sign-out/route.ts
+@@ -1,14 +1,16 @@
+ import { type NextRequest, NextResponse } from "next/server";
+ import { createServerClient } from "@/lib/supabase/server";
+ 
+-// GET-friendly sign-out (link-triggered): clears the server session and
+-// returns to the app origin, not the Supabase backend. Uses the request's
+-// own origin so it works on localhost and Vercel equally.
+-export async function GET(request: NextRequest) {
++// POST-only sign-out. A state-changing action must not be reachable via GET ΓÇö
++// a GET sign-out is trivially CSRF-able (`<img src="/sign-out">` on any page
++// would force-log-out the user). Callers submit a same-origin <form method
++//="post">, which browsers only issue on real user intent. Clears the server
++// session and returns to the app origin (303 so the redirect is followed as a
++// GET), using the request's own origin so it works on localhost and Vercel.
++export async function POST(request: NextRequest) {
+   const supabase = await createServerClient();
+   await supabase.auth.signOut();
+ 
+   const home = new URL("/", request.nextUrl.origin);
+-  const res = NextResponse.redirect(home);
+-  return res;
++  return NextResponse.redirect(home, { status: 303 });
+ }
+diff --git a/app/staff/layout.tsx b/app/staff/layout.tsx
+index e058776..1740a0a 100644
+--- a/app/staff/layout.tsx
++++ b/app/staff/layout.tsx
+@@ -2,6 +2,7 @@ import Link from "next/link";
+ import { getCurrentStaff } from "@/lib/auth/context";
+ import ThemeToggle from "@/components/ThemeToggle";
+ import LangToggle from "@/components/LangToggle";
++import SignOutButton from "@/components/SignOutButton";
+ 
+ export default async function StaffLayout({ children }: { children: React.ReactNode }) {
+   const staff = await getCurrentStaff();
+@@ -31,12 +32,7 @@ export default async function StaffLayout({ children }: { children: React.ReactN
+             <LangToggle />
+             <div className="h-4 w-px bg-ms-border mx-1" aria-hidden="true" />
+             <ThemeToggle />
+-            <Link
+-              href="/sign-out"
+-              className="rounded-ms-sm border border-ms-border px-3 py-2 text-sm text-ms-textSecondary transition-colors hover:border-brand hover:text-brand"
+-            >
+-              Sign out
+-            </Link>
++            <SignOutButton className="rounded-ms-sm border border-ms-border px-3 py-2 text-sm text-ms-textSecondary transition-colors hover:border-brand hover:text-brand" />
+           </div>
+         </div>
+       </header>
+@@ -46,7 +42,7 @@ export default async function StaffLayout({ children }: { children: React.ReactN
+           <div className="rounded-ms-md border border-[#E8C97A] bg-warning-tint p-5 text-sm text-warning">
+             <p className="font-semibold">Account not registered</p>
+             <p className="mt-1">Your phone number is not registered as Vyas staff. Contact your district admin to be added.{" "}
+-              <a href="/sign-out" className="font-medium underline">Sign out</a>
++              <SignOutButton className="font-medium underline" />
+             </p>
+           </div>
+         ) : (
+diff --git a/components/LandingStoryClient.tsx b/components/LandingStoryClient.tsx
+index e09729a..153a51c 100644
+--- a/components/LandingStoryClient.tsx
++++ b/components/LandingStoryClient.tsx
+@@ -3,6 +3,7 @@
+ import Link from "next/link";
+ import { useEffect, useRef, useState, MouseEvent } from "react";
+ import { useLanguage } from "@/lib/i18n/LanguageContext";
++import SignOutButton from "@/components/SignOutButton";
+ 
+ interface Props {
+   staff: { name: string; role: string } | null;
+@@ -253,9 +254,9 @@ export default function LandingStoryClient({ staff }: Props) {
+             {staff && (
+               <p className="hero-animate hero-d4 mt-6 text-sm text-ms-textSecondary">
+                 {t.signed_in_as} <strong className="text-ms-textPrimary">{staff.name}</strong> ({staff.role}) ┬╖{" "}
+-                <a href="/sign-out" className="text-brand underline underline-offset-2 hover:text-brand-hover">
++                <SignOutButton className="text-brand underline underline-offset-2 hover:text-brand-hover">
+                   {t.sign_out}
+-                </a>
++                </SignOutButton>
+               </p>
+             )}
+           </div>
+diff --git a/components/LangToggle.tsx b/components/LangToggle.tsx
+index 3a1baad..2a7f2e6 100644
+--- a/components/LangToggle.tsx
++++ b/components/LangToggle.tsx
+@@ -7,8 +7,16 @@ export default function LangToggle() {
+   const { language, setLanguage } = useLanguage();
+ 
+   return (
+-    <div className="flex items-center gap-1 rounded-full bg-ms-border/50 p-1 text-xs font-medium">
++    <div
++      role="radiogroup"
++      aria-label="Language"
++      className="flex items-center gap-1 rounded-full bg-ms-border/50 p-1 text-xs font-medium"
++    >
+       <button
++        type="button"
++        role="radio"
++        aria-checked={language === "en"}
++        aria-label="English"
+         onClick={() => setLanguage("en")}
+         className={`rounded-full px-2.5 py-1 transition-colors ${
+           language === "en"
+@@ -19,6 +27,10 @@ export default function LangToggle() {
+         EN
+       </button>
+       <button
++        type="button"
++        role="radio"
++        aria-checked={language === "hi"}
++        aria-label="αñ╣αñ┐αñ¿αÑìαñªαÑÇ"
+         onClick={() => setLanguage("hi")}
+         className={`rounded-full px-2.5 py-1 transition-colors ${
+           language === "hi"
+diff --git a/components/SyncBanner.tsx b/components/SyncBanner.tsx
+index bdbc04f..b58bd71 100644
+--- a/components/SyncBanner.tsx
++++ b/components/SyncBanner.tsx
+@@ -21,8 +21,18 @@ export default function SyncBanner() {
+     setPrevOnline(online);
+   }, [online, prevOnline]);
+ 
++  const visible = !online || showSynced;
++
++  // Reserve the fixed banner's height (via a class on <html>) whenever it's
++  // shown, so it doesn't overlap the sticky page headers (see globals.css).
++  useEffect(() => {
++    const root = document.documentElement;
++    root.classList.toggle("ms-has-banner", visible);
++    return () => root.classList.remove("ms-has-banner");
++  }, [visible]);
++
+   // Fully hidden when online and not in "just-synced" flash state
+-  if (online && !showSynced) return null;
++  if (!visible) return null;
+ 
+   return (
+     <div
+diff --git a/components/index.ts b/components/index.ts
+deleted file mode 100644
+index 46b36aa..0000000
+--- a/components/index.ts
++++ /dev/null
+@@ -1,3 +0,0 @@
+-// Shared UI components ΓÇö severity badge, offline banner, voice button, etc.
+-// See DESIGN.md visual style guide.
+-export {};
+diff --git a/domain/admin/queries.ts b/domain/admin/queries.ts
+index d8af660..9305389 100644
+--- a/domain/admin/queries.ts
++++ b/domain/admin/queries.ts
+@@ -1,7 +1,17 @@
+ import { createServerClient } from "@/lib/supabase/server";
+-import { getCurrentStaff } from "@/lib/auth/context";
++import { getCurrentStaff, type StaffContext } from "@/lib/auth/context";
+ import type { FlagSeverityLike, FlagCategory } from "@/lib/types";
+ 
++// Each query can accept an already-resolved staff context so a page that loads
++// several of them (e.g. the admin dashboard) resolves auth ONCE and passes it
++// down, instead of every query re-running getCurrentStaff (4├ù auth.getUser +
++// 4├ù staff read for a single page). Falls back to resolving it when omitted.
++async function resolveStaff(
++  staff?: StaffContext | null
++): Promise<StaffContext | null> {
++  return staff !== undefined ? staff : await getCurrentStaff();
++}
++
+ export interface FlagRow {
+   id: string;
+   facility_id: string;
+@@ -40,8 +50,8 @@ export interface SuggestionRow {
+ // from Phase 1 join facilities.district). Never take a district param from the
+ // client.
+ 
+-export async function getDistrictFlags(): Promise<FlagRow[]> {
+-  const staff = await getCurrentStaff();
++export async function getDistrictFlags(staffCtx?: StaffContext | null): Promise<FlagRow[]> {
++  const staff = await resolveStaff(staffCtx);
+   if (!staff) return [];
+   const supabase = await createServerClient();
+   const { data, error } = await supabase
+@@ -75,8 +85,8 @@ export async function getDistrictFlags(): Promise<FlagRow[]> {
+   }));
+ }
+ 
+-export async function getDistrictFacilities(): Promise<FacilityMarker[]> {
+-  const staff = await getCurrentStaff();
++export async function getDistrictFacilities(staffCtx?: StaffContext | null): Promise<FacilityMarker[]> {
++  const staff = await resolveStaff(staffCtx);
+   if (!staff || staff.role !== "admin") return [];
+   const supabase = await createServerClient();
+ 
+@@ -103,8 +113,8 @@ export async function getDistrictFacilities(): Promise<FacilityMarker[]> {
+   }));
+ }
+ 
+-export async function getDistrictSuggestions(): Promise<SuggestionRow[]> {
+-  const staff = await getCurrentStaff();
++export async function getDistrictSuggestions(staffCtx?: StaffContext | null): Promise<SuggestionRow[]> {
++  const staff = await resolveStaff(staffCtx);
+   if (!staff || staff.role !== "admin") return [];
+   const supabase = await createServerClient();
+ 
+diff --git a/domain/flagging-analytics/forecast.test.ts b/domain/flagging-analytics/forecast.test.ts
+index 087d8d9..c97eaff 100644
+--- a/domain/flagging-analytics/forecast.test.ts
++++ b/domain/flagging-analytics/forecast.test.ts
+@@ -79,9 +79,14 @@ describe("severityForStock", () => {
+     expect(severityForStock(4)).toBe("warning");
+     expect(severityForStock(7)).toBe("warning");
+   });
+-  it("flags watch when daysToZero > 7 but trending down", () => {
++  it("flags watch when 7 < daysToZero <= 21 (trending down within horizon)", () => {
+     expect(severityForStock(10)).toBe("watch");
+-    expect(severityForStock(100)).toBe("watch");
++    expect(severityForStock(21)).toBe("watch");
++  });
++  it("does not flag when the runway is healthy (daysToZero > 21)", () => {
++    expect(severityForStock(22)).toBeNull();
++    expect(severityForStock(100)).toBeNull();
++    expect(severityForStock(365)).toBeNull();
+   });
+   it("does not flag when there is no consumption signal", () => {
+     expect(severityForStock(null)).toBeNull();
+diff --git a/domain/flagging-analytics/forecast.ts b/domain/flagging-analytics/forecast.ts
+index b6d2f51..26ab4ce 100644
+--- a/domain/flagging-analytics/forecast.ts
++++ b/domain/flagging-analytics/forecast.ts
+@@ -48,14 +48,22 @@ export function forecastStock(input: ForecastInput): ForecastResult {
+ //   ≡ƒö┤ critical: days-to-zero <= 3, OR bed occupancy 100%, OR doctor absent
+ //                  past cutoff with no prior notice
+ //   ≡ƒƒí warning:  days-to-zero <= 7
+-//   ≡ƒƒó watch:    declining trend but outside the above thresholds
++//   ≡ƒƒó watch:    declining trend but outside the above thresholds ΓÇö capped at
++//                WATCH_WINDOW_DAYS so a facility with months of runway is not
++//                flagged. Beyond that, the stock is healthy and gets no flag.
+ export type Severity = "critical" | "warning" | "watch";
+ 
++// A "declining trend" is only actionable inside a ~3-week horizon; past that,
++// there is nothing for an operator to do this cycle, so we don't flag it (this
++// prevents the dashboard from flooding with every item that has any history).
++const WATCH_WINDOW_DAYS = 21;
++
+ export function severityForStock(daysToZero: number | null): Severity | null {
+   if (daysToZero === null) return null; // no consumption recorded ΓÇö don't flag
+   if (daysToZero <= 3) return "critical";
+   if (daysToZero <= 7) return "warning";
+-  return "watch";
++  if (daysToZero <= WATCH_WINDOW_DAYS) return "watch";
++  return null; // healthy runway ΓÇö no flag needed
+ }
+ 
+ export function severityForBed(occupied: number, total: number): Severity | null {
+diff --git a/domain/flagging-analytics/runner.ts b/domain/flagging-analytics/runner.ts
+index 6572ed4..cf237c7 100644
+--- a/domain/flagging-analytics/runner.ts
++++ b/domain/flagging-analytics/runner.ts
+@@ -236,24 +236,28 @@ export async function evaluateDoctorFlag(
+ export async function sweepDoctorAbsence(cutoffHour = 11): Promise<number> {
+   const supabase = createServiceClient();
+   const { data: facilities } = await supabase.from("facilities").select("id");
++  if (!facilities || facilities.length === 0) return 0;
+ 
+-  let raised = 0;
+   const startOfToday = new Date();
+   startOfToday.setHours(0, 0, 0, 0);
+   const cutoffToday = new Date();
+   cutoffToday.setHours(cutoffHour, 0, 0, 0);
+ 
+-  for (const f of facilities ?? []) {
+-    const { count } = await supabase
+-      .from("doctor_attendance")
+-      // approximate count API: Supabase supports { count: "exact", head: true }
+-      .select("id", { count: "exact", head: true })
+-      .eq("facility_id", f.id)
+-      .gte("check_in", startOfToday.toISOString())
+-      .lte("check_in", cutoffToday.toISOString());
++  // Single query for all of today's pre-cutoff check-ins across the district,
++  // then compare in memory ΓÇö avoids the previous N+1 (one query per facility).
++  const { data: attendance } = await supabase
++    .from("doctor_attendance")
++    .select("facility_id")
++    .gte("check_in", startOfToday.toISOString())
++    .lte("check_in", cutoffToday.toISOString());
++
++  const checkedInFacilityIds = new Set(
++    (attendance ?? []).map((a) => a.facility_id as string)
++  );
+ 
+-    const checkedInByCutoff = (count ?? 0) > 0;
+-    if (!checkedInByCutoff) {
++  let raised = 0;
++  for (const f of facilities) {
++    if (!checkedInFacilityIds.has(f.id as string)) {
+       await evaluateDoctorFlag(f.id, false);
+       raised += 1;
+     }
+diff --git a/domain/patient-access/actions.ts b/domain/patient-access/actions.ts
+index 5514493..986ad4c 100644
+--- a/domain/patient-access/actions.ts
++++ b/domain/patient-access/actions.ts
+@@ -14,8 +14,11 @@ export async function askChatbot(
+   input: { query: string; language: "en" | "hi"; facilityId?: string; patientSession: string }
+ ): Promise<{ answer: string | null; grounded: boolean }> {
+   
+-  // Rate Limiting (20 req / minute per IP for public web chat)
+-  const ip = headers().get("x-forwarded-for") || "unknown-ip";
++  // Rate Limiting (20 req / minute per IP for public web chat).
++  // headers() is async in Next.js 16 ΓÇö must be awaited or the IP is always
++  // "unknown-ip" (every request shares one bucket, defeating the limiter).
++  const hdrs = await headers();
++  const ip = hdrs.get("x-forwarded-for") || "unknown-ip";
+   const { allowed } = await checkRateLimit({
+     ipOrPhone: ip,
+     maxRequests: 20,
+diff --git a/domain/patient-access/index.ts b/domain/patient-access/index.ts
+deleted file mode 100644
+index 6e4cb11..0000000
+--- a/domain/patient-access/index.ts
++++ /dev/null
+@@ -1,3 +0,0 @@
+-// Patient Access bounded context ΓÇö read-only, anonymized lookup into
+-// Resource Monitoring data and the bilingual chatbot. No write capability. (Phase 11)
+-export {};
+diff --git a/domain/redistribution/runner.ts b/domain/redistribution/runner.ts
+index e8f03b2..c5590ba 100644
+--- a/domain/redistribution/runner.ts
++++ b/domain/redistribution/runner.ts
+@@ -33,10 +33,11 @@ export async function suggestRedistribution(
+ ): Promise<number> {
+   const supabase = createServiceClient();
+ 
+-  // 1. Load the deficit facility (need its coords).
++  // 1. Load the deficit facility (need its coords AND its district ΓÇö the donor
++  //    query below scopes candidates to the same district).
+   const { data: deficitRow } = await supabase
+     .from("facilities")
+-    .select("id, name, lat, lng")
++    .select("id, name, lat, lng, district")
+     .eq("id", deficitFacilityId)
+     .single();
+   if (!deficitRow) return 0;
+diff --git a/domain/resource-monitoring/actions.ts b/domain/resource-monitoring/actions.ts
+index dcaa647..d25d8e9 100644
+--- a/domain/resource-monitoring/actions.ts
++++ b/domain/resource-monitoring/actions.ts
+@@ -319,30 +319,14 @@ export async function incrementFootfall(
+   const date = payload.date ?? new Date().toISOString().slice(0, 10);
+   const supabase = await createServerClient();
+ 
+-  // Upsert by (facility_id, date), incrementing count. Unique index
+-  // footfall_facility_date_uq covers the conflict target.
+-  const { data: existing } = await supabase
+-    .from("footfall_logs")
+-    .select("id, count")
+-    .eq("facility_id", payload.facilityId)
+-    .eq("date", date)
+-    .single();
+-
+-  if (existing) {
+-    const newCount = (existing.count as number) + 1;
+-    const { error } = await supabase
+-      .from("footfall_logs")
+-      .update({ count: newCount })
+-      .eq("id", existing.id);
+-    if (error) return fail(error.message);
+-    return ok({ facilityId: payload.facilityId, date, count: newCount });
+-  }
+-
+-  const { error } = await supabase.from("footfall_logs").insert({
+-    facility_id: payload.facilityId,
+-    date,
+-    count: 1,
++  // Atomic increment in a single statement (INSERT ... ON CONFLICT DO UPDATE
++  // SET count = count + 1 RETURNING count) via the increment_footfall RPC. The
++  // previous read-then-write lost increments under concurrency: two callers
++  // could both read N and both write N+1.
++  const { data, error } = await supabase.rpc("increment_footfall", {
++    p_facility_id: payload.facilityId,
++    p_date: date,
+   });
+   if (error) return fail(error.message);
+-  return ok({ facilityId: payload.facilityId, date, count: 1 });
++  return ok({ facilityId: payload.facilityId, date, count: data as number });
+ }
+diff --git a/domain/resource-monitoring/index.ts b/domain/resource-monitoring/index.ts
+deleted file mode 100644
+index fceec60..0000000
+--- a/domain/resource-monitoring/index.ts
++++ /dev/null
+@@ -1,3 +0,0 @@
+-// Resource Monitoring bounded context ΓÇö stock, bed, test availability, footfall.
+-// Owns the "what does a facility currently have" question. (Phase 3)
+-export {};
+diff --git a/domain/types.ts b/domain/types.ts
+index d4b482d..8e9d7a9 100644
+--- a/domain/types.ts
++++ b/domain/types.ts
+@@ -23,16 +23,9 @@ export interface ActionResult {
+   state?: Record<string, unknown>;
+ }
+ 
+-// Canonical envelope stored in the IndexedDB queue and passed to the replay
+-// router. The same shape is used for a live call (processed immediately) and
+-// a queued call (flushed on reconnect) ΓÇö that equivalence is the whole point.
+-export interface QueuedAction {
+-  id?: number;              // Dexie autoincrement, present once queued
+-  actionKey: ActionKey;
+-  payload: Record<string, unknown>;
+-  createdAt: number;
+-  synced: boolean;
+-}
++// The IndexedDB queue row shape lives in lib/offline/db.ts (QueuedRow) ΓÇö it is
++// the single canonical envelope stored and replayed. (An earlier duplicate
++// `QueuedAction` interface here was unused and has been removed.)
+ 
+ // Resource-monitoring action keys ΓÇö consumed by the offline replay router and
+ // by anything enumerating the staff-data-entry actions. Lives here (not in a
+diff --git a/domain/workforce/index.ts b/domain/workforce/index.ts
+deleted file mode 100644
+index e138d2c..0000000
+--- a/domain/workforce/index.ts
++++ /dev/null
+@@ -1,3 +0,0 @@
+-// Workforce bounded context ΓÇö doctor attendance, geo-tagged check-in/out.
+-// Owns the "who is actually present" question. (Phase 4)
+-export {};
+diff --git a/lib/ai/agent.ts b/lib/ai/agent.ts
+index 5b9b335..bd0010a 100644
+--- a/lib/ai/agent.ts
++++ b/lib/ai/agent.ts
+@@ -182,6 +182,12 @@ export async function runAgent(input: AgentInput): Promise<string> {
+     : "Sorry, it's taking me too long to find the answer.";
+ }
+ 
++// Escape LIKE/ILIKE wildcards in user- (LLM-) supplied input so a value like
++// "%" can't match every row. `\` is the default PostgREST escape char.
++function escapeLike(s: unknown): string {
++  return String(s ?? "").replace(/([\\%_])/g, "\\$1");
++}
++
+ async function executeTool(name: string, argsString: string, lang: "en" | "hi"): Promise<string> {
+   const supabase = createServiceClient();
+   let args: any;
+@@ -193,15 +199,15 @@ async function executeTool(name: string, argsString: string, lang: "en" | "hi"):
+ 
+   switch (name) {
+     case "search_stock": {
+-      const { data: f } = await supabase.from("facilities").select("id").ilike("name", `%${args.facilityName}%`).maybeSingle();
++      const { data: f } = await supabase.from("facilities").select("id").ilike("name", `%${escapeLike(args.facilityName)}%`).maybeSingle();
+       if (!f) return `Facility ${args.facilityName} not found.`;
+-      const { data: stock } = await supabase.from("stock_items").select("quantity, unit").eq("facility_id", f.id).ilike("item_name", `%${args.itemName}%`).maybeSingle();
++      const { data: stock } = await supabase.from("stock_items").select("quantity, unit").eq("facility_id", f.id).ilike("item_name", `%${escapeLike(args.itemName)}%`).maybeSingle();
+       if (!stock) return `Item ${args.itemName} not found at ${args.facilityName}.`;
+       return `${args.itemName} has ${stock.quantity} ${stock.unit}.`;
+     }
+ 
+     case "check_bed_availability": {
+-      const { data: f } = await supabase.from("facilities").select("id").ilike("name", `%${args.facilityName}%`).maybeSingle();
++      const { data: f } = await supabase.from("facilities").select("id").ilike("name", `%${escapeLike(args.facilityName)}%`).maybeSingle();
+       if (!f) return `Facility ${args.facilityName} not found.`;
+       const { data: beds } = await supabase.from("bed_status").select("total, occupied").eq("facility_id", f.id).maybeSingle();
+       if (!beds) return "No bed data.";
+@@ -209,15 +215,15 @@ async function executeTool(name: string, argsString: string, lang: "en" | "hi"):
+     }
+ 
+     case "check_test_availability": {
+-      const { data: f } = await supabase.from("facilities").select("id").ilike("name", `%${args.facilityName}%`).maybeSingle();
++      const { data: f } = await supabase.from("facilities").select("id").ilike("name", `%${escapeLike(args.facilityName)}%`).maybeSingle();
+       if (!f) return `Facility not found.`;
+-      const { data: test } = await supabase.from("test_availability").select("is_functional").eq("facility_id", f.id).ilike("test_name", `%${args.testName}%`).maybeSingle();
++      const { data: test } = await supabase.from("test_availability").select("is_functional").eq("facility_id", f.id).ilike("test_name", `%${escapeLike(args.testName)}%`).maybeSingle();
+       if (!test) return "Test not found.";
+       return `Test is ${test.is_functional ? "functional" : "not functional"}.`;
+     }
+ 
+     case "get_doctor_status": {
+-      const { data: f } = await supabase.from("facilities").select("id").ilike("name", `%${args.facilityName}%`).maybeSingle();
++      const { data: f } = await supabase.from("facilities").select("id").ilike("name", `%${escapeLike(args.facilityName)}%`).maybeSingle();
+       if (!f) return `Facility not found.`;
+       
+       const today = new Date().toISOString().split("T")[0];
+diff --git a/lib/ai/gemini.ts b/lib/ai/gemini.ts
+index 1f7634d..06e3daf 100644
+--- a/lib/ai/gemini.ts
++++ b/lib/ai/gemini.ts
+@@ -1,6 +1,9 @@
+-"use server";
++// NOTE: intentionally NOT a "use server" module. These are internal server-side
++// helpers (called from the flagging runner and the AI agent), not form/button
++// Server Actions. Marking the file "use server" would expose complete() and
++// generateFlagExplanation() as client-callable endpoints ΓÇö an open proxy for
++// arbitrary LLM calls through our key. Keep them as ordinary server imports.
+ 
+-import { z } from "zod";
+ import { createServiceClient } from "@/lib/supabase/server";
+ 
+ // ===========================================================================
+diff --git a/lib/ai/index.ts b/lib/ai/index.ts
+deleted file mode 100644
+index d98e921..0000000
+--- a/lib/ai/index.ts
++++ /dev/null
+@@ -1,3 +0,0 @@
+-// AI module: Gemini/OpenRouter client, forecast engine, severity rules,
+-// redistribution matcher. See DESIGN.md Section 7 (three-stage pipeline).
+-export {};
+diff --git a/lib/ats/router.ts b/lib/ats/router.ts
+index 808861c..4a315cc 100644
+--- a/lib/ats/router.ts
++++ b/lib/ats/router.ts
+@@ -10,8 +10,8 @@ const GREETINGS = ["hi", "hello", "namaste", "hii", "hey", "hola"];
+ const CLOSINGS = ["thanks", "thank you", "dhanyavad", "bye", "goodbye"];
+ 
+ const GREETING_RESPONSE = {
+-  en: "Hello! I am the MediServ assistant. How can I help you today? You can ask about medicines, beds, or tests.",
+-  hi: "αñ¿αñ«αñ╕αÑìαññαÑç! αñ«αÑêαñé MediServ αñ╕αñ╣αñ╛αñ»αñò αñ╣αÑéαñüαÑñ αñ«αÑêαñé αñåαñ¬αñòαÑÇ αñòαÑêαñ╕αÑç αñ«αñªαñª αñòαñ░ αñ╕αñòαññαñ╛ αñ╣αÑéαñü? αñåαñ¬ αñªαñ╡αñ╛αñôαñé, αñ¼αñ┐αñ╕αÑìαññαñ░αÑïαñé, αñ»αñ╛ αñƒαÑçαñ╕αÑìαñƒ αñòαÑç αñ¼αñ╛αñ░αÑç αñ«αÑçαñé αñ¬αÑéαñ¢ αñ╕αñòαññαÑç αñ╣αÑêαñéαÑñ"
++  en: "Hello! I am the Vyas assistant. How can I help you today? You can ask about medicines, beds, or tests.",
++  hi: "αñ¿αñ«αñ╕αÑìαññαÑç! αñ«αÑêαñé Vyas αñ╕αñ╣αñ╛αñ»αñò αñ╣αÑéαñüαÑñ αñ«αÑêαñé αñåαñ¬αñòαÑÇ αñòαÑêαñ╕αÑç αñ«αñªαñª αñòαñ░ αñ╕αñòαññαñ╛ αñ╣αÑéαñü? αñåαñ¬ αñªαñ╡αñ╛αñôαñé, αñ¼αñ┐αñ╕αÑìαññαñ░αÑïαñé, αñ»αñ╛ αñƒαÑçαñ╕αÑìαñƒ αñòαÑç αñ¼αñ╛αñ░αÑç αñ«αÑçαñé αñ¬αÑéαñ¢ αñ╕αñòαññαÑç αñ╣αÑêαñéαÑñ"
+ };
+ 
+ const CLOSING_RESPONSE = {
+@@ -94,7 +94,7 @@ async function checkAvailabilityDeterministic(itemName: string, facilityName: st
+   const supabase = createServiceClient();
+   
+   // 1. Fetch facilities
+-  const { data: facilities } = await supabase.select("id, name").from("facilities");
++  const { data: facilities } = await supabase.from("facilities").select("id, name");
+   if (!facilities) return null;
+ 
+   let targetFacilityId = null;
+@@ -166,35 +166,41 @@ async function handleStructuredStockUpdate(itemName: string, qty: number, facili
+     facilityId = matched[0].id;
+   }
+ 
+-  // Find item
+-  let query = supabase.from("stock_items").select("id, item_name");
++  // Find item. Read the current quantity too so we can record the true delta
++  // (the change), not the new absolute quantity ΓÇö stock_logs.delta drives the
++  // consumption/restock forecast, so an absolute value here would corrupt it.
++  let query = supabase.from("stock_items").select("id, item_name, quantity");
+   if (facilityId) query = query.eq("facility_id", facilityId);
+-  
++
+   const { data: items } = await query;
+   if (!items) return null;
+ 
+   const matchedItem = fuzzyMatch(itemName, items, "item_name");
+   if (matchedItem.length !== 1) return null; // Ambiguous
+ 
+-  // We have exactly one item. Since we are server-side, we bypass the queue and write directly to stock_items 
+-  // (or we could use the queue, but for simplicity of the ATS standalone capability we'll just write it if we know the ID).
+-  // Actually, standard system design says use the queue: 
+-  // But ATS router is synchronous. Let's just update stock_items and insert a log.
+-  
+-  const targetId = matchedItem[0].id;
+-  
+-  const { error: updateErr } = await supabase.from("stock_items").update({ quantity: qty, updated_at: new Date().toISOString() }).eq("id", targetId);
++  // We have exactly one item. ATS runs server-side and synchronously, so it
++  // writes the new absolute quantity directly and appends the signed delta.
++  const target = matchedItem[0] as { id: string; item_name: string; quantity: number };
++  const targetId = target.id;
++  const delta = qty - (target.quantity ?? 0);
++
++  const { error: updateErr } = await supabase
++    .from("stock_items")
++    .update({ quantity: qty, updated_at: new Date().toISOString() })
++    .eq("id", targetId);
+   if (updateErr) return null;
+ 
+-  await supabase.from("stock_logs").insert({
+-    stock_item_id: targetId,
+-    delta: qty, // Note: Phase 1 delta is raw quantity? Actually, delta in stock_logs is +/-, but we don't know the old qty. 
+-                // Let's just record 0 delta to be safe, or fetch old qty. 
+-                // For this demo, just updating stock_items is sufficient for the ATS success path.
+-    source: "sms"
+-  });
++  // Only append an audit row when the quantity actually changed. delta is the
++  // signed change (negative = consumption, positive = restock).
++  if (delta !== 0) {
++    await supabase.from("stock_logs").insert({
++      stock_item_id: targetId,
++      delta,
++      source: "sms",
++    });
++  }
+ 
+-  return { response: `Γ£à Stock updated: ${matchedItem[0].item_name} is now ${qty}.` };
++  return { response: `Γ£à Stock updated: ${target.item_name} is now ${qty}.` };
+ }
+ 
+ // Very simple substring / exact match (no heavy NLP)
+diff --git a/lib/i18n/LanguageContext.tsx b/lib/i18n/LanguageContext.tsx
+index fc6dfb1..64d3c8b 100644
+--- a/lib/i18n/LanguageContext.tsx
++++ b/lib/i18n/LanguageContext.tsx
+@@ -12,24 +12,23 @@ type LanguageContextType = {
+ const LanguageContext = createContext<LanguageContextType | undefined>(undefined);
+ 
+ export function LanguageProvider({ children }: { children: React.ReactNode }) {
++  // Server and first client render always use "en" (matching state below), so
++  // there is no hydration mismatch. The saved/detected language is applied in
++  // the effect after mount ΓÇö a normal client update, no need to hide the app.
+   const [language, setLanguageState] = useState<Language>("en");
+-  const [mounted, setMounted] = useState(false);
+ 
+   useEffect(() => {
+     // 1. Check local storage first
+     const saved = localStorage.getItem("vyas-language") as Language;
+     if (saved && (saved === "en" || saved === "hi")) {
+       setLanguageState(saved);
+-    } else {
++    } else if (typeof navigator !== "undefined") {
+       // 2. Auto-detect from browser
+-      if (typeof navigator !== "undefined") {
+-        const browserLang = navigator.language.toLowerCase();
+-        if (browserLang.startsWith("hi")) {
+-          setLanguageState("hi");
+-        }
++      const browserLang = navigator.language.toLowerCase();
++      if (browserLang.startsWith("hi")) {
++        setLanguageState("hi");
+       }
+     }
+-    setMounted(true);
+   }, []);
+ 
+   const setLanguage = (lang: Language) => {
+@@ -41,11 +40,7 @@ export function LanguageProvider({ children }: { children: React.ReactNode }) {
+ 
+   return (
+     <LanguageContext.Provider value={{ language, setLanguage, t }}>
+-      {!mounted ? (
+-        <div style={{ visibility: "hidden" }}>{children}</div>
+-      ) : (
+-        children
+-      )}
++      {children}
+     </LanguageContext.Provider>
+   );
+ }
+diff --git a/lib/offline/sync-provider.tsx b/lib/offline/sync-provider.tsx
+index 386bb8b..0acee60 100644
+--- a/lib/offline/sync-provider.tsx
++++ b/lib/offline/sync-provider.tsx
+@@ -103,9 +103,12 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
+     async (domain, action, payload, onResult) => {
+       // 1. Enqueue in IndexedDB first ΓÇö durable even if the immediate sync below
+       //    fails. This is the heart of ADR-003's offline-first guarantee.
++      let newRowId: number;
+       try {
+         const db = getDB();
+-        await db.writeQueue.add({
++        // add() returns the autoincrement key of the row it just inserted, so
++        // we can delete exactly that row on success ΓÇö no need to scan the queue.
++        newRowId = await db.writeQueue.add({
+           domain,
+           action,
+           payload,
+@@ -127,22 +130,16 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
+       //    update can be reconciled). Offline => the queued row waits for the
+       //    flusher.
+       if (typeof navigator !== "undefined" && navigator.onLine) {
+-        // Find the row just added and flush from it. Simpler: trigger a normal
+-        // flush, which processes in order and calls onResult via the wrapper.
+         const db = getDB();
+-        const rows = await db.writeQueue.orderBy("createdAt").reverse().toArray();
+-        const lastRow = rows.find((r) => r.action === action && !r.synced);
+-        if (lastRow) {
+-          try {
+-            const res = await replayAction(action, payload);
+-            if (res.ok) {
+-              await db.writeQueue.delete(lastRow.id!);
+-              refreshQueueLength();
+-            }
+-            onResult?.(res);
+-          } catch (err) {
+-            flushStateFromError(err);
++        try {
++          const res = await replayAction(action, payload);
++          if (res.ok) {
++            await db.writeQueue.delete(newRowId);
++            refreshQueueLength();
+           }
++          onResult?.(res);
++        } catch (err) {
++          flushStateFromError(err);
+         }
+       }
+     },
+diff --git a/lib/rate-limit.ts b/lib/rate-limit.ts
+index 6ded1c7..3309aed 100644
+--- a/lib/rate-limit.ts
++++ b/lib/rate-limit.ts
+@@ -6,61 +6,41 @@ interface RateLimitConfig {
+   windowMinutes: number;
+ }
+ 
++// Fixed-window rate limiter backed by Postgres. The increment is done in a
++// single atomic `increment_rate_limit` RPC (INSERT ... ON CONFLICT DO UPDATE
++// SET hit_count = hit_count + 1 RETURNING hit_count), so two concurrent
++// requests can never both read the same count and lose an increment.
++//
++// Fails CLOSED (denies) on DB error: these limiters guard spoofable public
++// endpoints (SMS/WhatsApp webhooks, the public chat), so if the store is
++// unavailable we must not let unbounded traffic through.
+ export async function checkRateLimit({
+   ipOrPhone,
+   maxRequests,
+   windowMinutes,
+ }: RateLimitConfig): Promise<{ allowed: boolean; remaining: number }> {
+   const supabase = createServiceClient();
+-  const now = new Date();
+-  
+-  // Truncate to the current window start
+-  // e.g., if windowMinutes is 1, truncate to the current minute
+-  const windowStart = new Date(now.getTime() - (now.getTime() % (windowMinutes * 60 * 1000)));
+-
+-  // Try to insert a new window row, or increment if it exists (using a Postgres RPC or an upsert)
+-  // Supabase postgREST supports upserts with on_conflict.
+-  const { data, error } = await supabase
+-    .from("rate_limits")
+-    .upsert(
+-      {
+-        ip_or_phone: ipOrPhone,
+-        window_start: windowStart.toISOString(),
+-      },
+-      {
+-        onConflict: "ip_or_phone,window_start",
+-        ignoreDuplicates: false,
+-      }
+-    )
+-    .select("hit_count")
+-    .single();
+-
+-  if (error) {
+-    console.error("Rate limit check failed (failing open)", error);
+-    return { allowed: true, remaining: maxRequests - 1 };
+-  }
+-
+-  // If we just inserted it, hit_count is 1. We need to increment it if it already existed.
+-  // Wait, standard upsert doesn't increment natively unless we use an RPC. 
+-  // Let's use RPC if possible, but since we didn't write one, we can do a read-then-write or use a simple hack.
+-  // Wait! A standard upsert will just overwrite with hit_count=default (1) unless we specify hit_count.
+-  // We can just read the current, then update it. It's not perfectly atomic but it's fine for a demo rate limiter.
+-  
+-  const currentHits = data?.hit_count ?? 1;
+-
+-  if (currentHits > 1) {
+-     // it was already there, increment it
+-     await supabase
+-       .from("rate_limits")
+-       .update({ hit_count: currentHits + 1 })
+-       .eq("ip_or_phone", ipOrPhone)
+-       .eq("window_start", windowStart.toISOString());
++  const now = Date.now();
++
++  // Truncate to the current window start (e.g. windowMinutes=1 => this minute).
++  const windowMs = windowMinutes * 60 * 1000;
++  const windowStart = new Date(now - (now % windowMs));
++
++  const { data, error } = await supabase.rpc("increment_rate_limit", {
++    p_ip_or_phone: ipOrPhone,
++    p_window_start: windowStart.toISOString(),
++  });
++
++  if (error || typeof data !== "number") {
++    // Fail closed ΓÇö an attacker must not be able to bypass the limiter by
++    // making the store fail. Report zero remaining.
++    console.error("Rate limit check failed (failing closed)", error);
++    return { allowed: false, remaining: 0 };
+   }
+ 
+-  const newHits = currentHits > 1 ? currentHits + 1 : 1;
+-
++  const hits = data;
+   return {
+-    allowed: newHits <= maxRequests,
+-    remaining: Math.max(0, maxRequests - newHits),
++    allowed: hits <= maxRequests,
++    remaining: Math.max(0, maxRequests - hits),
+   };
+ }
+diff --git a/lib/supabase/server.ts b/lib/supabase/server.ts
+index 32b8713..f421f90 100644
+--- a/lib/supabase/server.ts
++++ b/lib/supabase/server.ts
+@@ -12,13 +12,14 @@ const anon = () => process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
+ // and route handlers. Reads + writes the auth session via Next cookies.
+ // Lazy + non-throwing on missing env so build-time prerender of protected
+ // layouts doesn't crash; an actual auth/db call will surface the error.
+-let cachedServer: SupabaseClient | null = null;
+-
++//
++// IMPORTANT: a fresh client is built on every call. `cookies()` is per-request,
++// and in a serverless/warm-container environment a module-level cache would
++// bleak the first request's cookie store (and therefore its auth session) into
++// every subsequent request. `cookies()` is cheap, so there is nothing to cache.
+ export async function createServerClient(): Promise<SupabaseClient> {
+-  if (cachedServer) return cachedServer;
+-
+   const cookieStore = await cookies();
+-  cachedServer = createSSRClient(url(), anon(), {
++  return createSSRClient(url(), anon(), {
+     cookies: {
+       getAll() {
+         return cookieStore.getAll();
+@@ -35,12 +36,6 @@ export async function createServerClient(): Promise<SupabaseClient> {
+       },
+     },
+   });
+-  return cachedServer;
+-}
+-
+-// Reset the cached server client between tests / when env changes.
+-export function __resetServerClient(): void {
+-  cachedServer = null;
+ }
+ 
+ // Middleware variant: build a server client from the middleware's request
+diff --git a/next.config.ts b/next.config.ts
+index 855474d..729a138 100644
+--- a/next.config.ts
++++ b/next.config.ts
+@@ -12,6 +12,12 @@ const withPWA = withPWAInit({
+ 
+ const nextConfig: NextConfig = {
+   reactStrictMode: true,
++  poweredByHeader: false,
++  // Strip console.* (except errors/warnings) from the production client bundle
++  // ΓÇö smaller JS, less main-thread work (helps Lighthouse TBT).
++  compiler: {
++    removeConsole: process.env.NODE_ENV === "production" ? { exclude: ["error", "warn"] } : false,
++  },
+   experimental: {
+     serverActions: {
+       bodySizeLimit: "2mb",
+diff --git a/package-lock.json b/package-lock.json
+index 85306d1..dcc67d5 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,11 +1,11 @@
+ {
+-  "name": "mediserv",
++  "name": "vyas",
+   "version": "0.1.0",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+-      "name": "mediserv",
++      "name": "vyas",
+       "version": "0.1.0",
+       "dependencies": {
+         "@ducanh2912/next-pwa": "^10.2.9",
+diff --git a/rename.js b/rename.js
+deleted file mode 100644
+index 9a1b275..0000000
+--- a/rename.js
++++ /dev/null
+@@ -1,43 +0,0 @@
+-const fs = require('fs');
+-const path = require('path');
+-
+-function walkDir(dir, callback) {
+-  fs.readdirSync(dir).forEach(f => {
+-    let dirPath = path.join(dir, f);
+-    let isDirectory = fs.statSync(dirPath).isDirectory();
+-    isDirectory ? 
+-      walkDir(dirPath, callback) : callback(dirPath);
+-  });
+-}
+-
+-function replaceInFile(filePath) {
+-  if (!filePath.match(/\.(tsx|ts|js|jsx|css|md|json)$/)) return;
+-  // Exclude node_modules, .next, etc
+-  if (filePath.includes('node_modules') || filePath.includes('.next') || filePath.includes('.git')) return;
+-
+-  const content = fs.readFileSync(filePath, 'utf8');
+-  let newContent = content;
+-  
+-  // Replace exact cases
+-  newContent = newContent.replace(/MediServ/g, 'Vyas');
+-  newContent = newContent.replace(/mediserv/g, 'vyas');
+-
+-  if (newContent !== content) {
+-    fs.writeFileSync(filePath, newContent, 'utf8');
+-    console.log('Updated:', filePath);
+-  }
+-}
+-
+-const rootDirs = ['./app', './components', './lib', './public', './UI&UX.md', './ARCHITECTURE.md', './BUILD.md', './DECISIONS.md', './DESIGN.md', './README.md', './package.json'];
+-
+-rootDirs.forEach(item => {
+-  if (fs.existsSync(item)) {
+-    if (fs.statSync(item).isDirectory()) {
+-      walkDir(item, replaceInFile);
+-    } else {
+-      replaceInFile(item);
+-    }
+-  }
+-});
+-
+-console.log('Rename complete.');
+diff --git a/tailwind.config.ts b/tailwind.config.ts
+index 5fa404e..90e2d37 100644
+--- a/tailwind.config.ts
++++ b/tailwind.config.ts
+@@ -40,8 +40,9 @@ const config: Config = {
+       },
+ 
+       fontFamily: {
+-        sans:  ["Inter", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "Helvetica Neue", "Arial", "sans-serif"],
+-        hindi: ["Noto Sans Devanagari", "Inter", "sans-serif"],
++        // Backed by next/font CSS variables (self-hosted; see app/layout.tsx).
++        sans:  ["var(--font-inter)", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "Helvetica Neue", "Arial", "sans-serif"],
++        hindi: ["var(--font-devanagari)", "var(--font-inter)", "sans-serif"],
+       },
+ 
+       fontSize: {
